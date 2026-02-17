@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from collections import deque
 from typing import Deque, Dict, Iterable, List, Tuple, Mapping
+import time
 
 import numpy as np
 
@@ -12,9 +13,27 @@ SPEED_OF_LIGHT = 299_792_458.0
 
 
 @dataclass
+class ClockCorrectionStorage:
+    """Bitcraze-compatible clock correction with leaky bucket algorithm."""
+    clock_correction: float = 1.0
+    bucket: int = 0  # leaky bucket counter for noise rejection
+    
+    # Bitcraze constants (from clockCorrectionEngine.c)
+    BUCKET_MAX = 4
+    SPEC_DEVIATION = 10e-5  # 10 ppm
+    SPEC_MIN = 1.0 - SPEC_DEVIATION * 2  # 1.0 - 20ppm
+    SPEC_MAX = 1.0 + SPEC_DEVIATION * 2  # 1.0 + 20ppm
+    ACCEPTED_NOISE = 0.1e-6  # 0.03 ppm
+    FILTER_COEFF = 0.1  # low-pass filter coefficient
+
+
+@dataclass
 class TdoaSolveResult:
     position: np.ndarray
     residual_rms: float
+    residual_rms_used: float
+    measurements_used: int
+    measurements_total: int
     iterations: int
     success: bool
 
@@ -22,17 +41,18 @@ class TdoaSolveResult:
 @dataclass
 class AnchorFrame:
     seq: int
-    tx_ts: int  # 32-bit (anchor clock domain)
-    rx_ts: int  # 32-bit (tag clock domain; user reports LSBs dropped)
+    tx_ts: int  # 64-bit (anchor clock domain, truncated during calc)
+    rx_ts: int  # 64-bit (tag clock domain, truncated during calc)
+    update_time: float  # timestamp when this frame was received (for matching algorithm)
 
 
 class TdoaFrameMatcher:
     """Matches TDoA3 packets and computes TDoA distance-difference measurements.
 
-    This is a Python adaptation of the Crazyflie TDoA3 math:
+    This is a Python adaptation of the Crazyflie TDoA3 math (Bitcraze-compatible):
 
     - Maintain per-anchor history of (seq, tx_ts, rx_ts)
-    - Maintain per-anchor clock correction estimate (tag_clock / anchor_clock)
+    - Maintain per-anchor clock correction estimate with leaky bucket algorithm
     - For each remote report in a packet, find the corresponding remote anchor frame
       with matching seq number.
     - Compute TDoA in tag clock ticks and convert to meters.
@@ -58,9 +78,8 @@ class TdoaFrameMatcher:
         antenna_delay_ticks: int = 16436,
         clock_correction: float = 1.0,
         history_size: int = 8,
-        # Conservative bounds for DW1000 drift (100 ppm) but doubled for margin.
+        # Bitcraze uses 20 ppm (MAX_CLOCK_DEVIATION_SPEC = 10ppm, doubled for margin)
         clock_correction_ppm: float = 200.0,
-        clock_correction_filter: float = 0.1,
         max_abs_distance_diff_m: float = 1000.0,
         subtract_antenna_delay: bool = True,
         tdoa_sign: float = 1.0,
@@ -71,8 +90,10 @@ class TdoaFrameMatcher:
         max_tof_ticks: int = 65535,
         # Optional: use anchor positions to reject impossible distance-differences.
         anchors: Mapping[int, np.ndarray] | None = None,
-        distance_diff_margin_m: float = 0.25,
-        max_remote_history_age: int = 1,
+        distance_diff_margin_m: float = 0.5,
+        max_remote_history_age: int = 8,
+        # Matching algorithm: "random" or "youngest"
+        matching_algorithm: str = "youngest",
     ) -> None:
         self._tick_frequency_hz = float(tick_frequency_hz)
         self._antenna_delay_ticks = int(antenna_delay_ticks)
@@ -80,19 +101,17 @@ class TdoaFrameMatcher:
         self._history_size = max(1, int(history_size))
 
         self._frames: Dict[int, Deque[AnchorFrame]] = {}
-        self._clock_correction_by_anchor: Dict[int, float] = {}
+        self._clock_correction_storage: Dict[int, ClockCorrectionStorage] = {}
 
         corr = clock_correction_ppm * 1e-6
         self._clock_correction_spec_min = 1.0 - corr
         self._clock_correction_spec_max = 1.0 + corr
-        self._clock_correction_filter = float(clock_correction_filter)
-
 
         # Your packets use 32-bit RX timestamps (with some LSBs dropped).
-        # Keep everything in the same 32-bit space to avoid false huge deltas.
+        # But we keep them as 64-bit internally and truncate only during calculations
         self._truncate_mask = (1 << 32) - 1
 
-        # Hard outlier rejection. If your anchor constellation is larger, increase this.
+        # Hard outlier rejection.
         self._max_abs_distance_diff_m = float(max_abs_distance_diff_m)
         self._subtract_antenna_delay = bool(subtract_antenna_delay)
         self._tdoa_sign = float(tdoa_sign)
@@ -102,6 +121,8 @@ class TdoaFrameMatcher:
         self._anchors = dict(anchors) if anchors is not None else None
         self._distance_diff_margin_m = float(distance_diff_margin_m)
         self._max_remote_history_age = int(max_remote_history_age)
+        self._matching_algorithm = str(matching_algorithm).lower()
+        self._match_offset = 0  # for random matching algorithm
 
     def _push_frame(self, anchor_id: int, frame: AnchorFrame) -> None:
         history = self._frames.get(anchor_id)
@@ -110,24 +131,20 @@ class TdoaFrameMatcher:
             self._frames[anchor_id] = history
         history.appendleft(frame)
 
-    def _find_frame(self, anchor_id: int, seq: int) -> tuple[AnchorFrame | None, int | None]:
-        history = self._frames.get(anchor_id)
-        if not history:
-            return None, None
-        for age, frame in enumerate(history):
-            if frame.seq == seq:
-                return frame, age
-        return None, None
+    def update(self, parsed_frame) -> List[Tuple[int, float]]:
+        measurements, _ = self._compute(parsed_frame)
+        return measurements
 
     def _update_clock_correction(self, anchor_id: int, frame: AnchorFrame) -> float | None:
+        """Update clock correction using Bitcraze leaky bucket algorithm."""
         history = self._frames.get(anchor_id)
         if not history or len(history) < 2:
             return None
         prev = history[1]
 
-        # Remote (anchor) timestamps are 32-bit
+        # Remote (anchor) timestamps are stored as 64-bit internally
         tick_count_remote = self._wrapped_delta(frame.tx_ts, prev.tx_ts, 2**32)
-        # Local (tag) RX timestamps are also 32-bit in your stream
+        # Local (tag) RX timestamps are also truncated to 32-bit for calculation
         tick_count_local = self._wrapped_delta(frame.rx_ts, prev.rx_ts, 2**32)
 
         if tick_count_remote == 0:
@@ -138,10 +155,38 @@ class TdoaFrameMatcher:
         if not (self._clock_correction_spec_min <= candidate <= self._clock_correction_spec_max):
             return None
 
-        current = self._clock_correction_by_anchor.get(anchor_id, candidate)
-        filtered = current * (1.0 - self._clock_correction_filter) + candidate * self._clock_correction_filter
-        self._clock_correction_by_anchor[anchor_id] = filtered
-        return filtered
+        # Get or create storage for this anchor (Bitcraze-compatible)
+        if anchor_id not in self._clock_correction_storage:
+            self._clock_correction_storage[anchor_id] = ClockCorrectionStorage()
+        
+        storage = self._clock_correction_storage[anchor_id]
+        current = storage.clock_correction
+        difference = candidate - current
+
+        # Bitcraze leaky bucket algorithm
+        # If sample is within accepted noise level, apply LP filter and fill bucket
+        if abs(difference) < ClockCorrectionStorage.ACCEPTED_NOISE:
+            filtered = current * (1.0 - ClockCorrectionStorage.FILTER_COEFF) + candidate * ClockCorrectionStorage.FILTER_COEFF
+            storage.clock_correction = filtered
+            # Fill bucket (max 4)
+            if storage.bucket < ClockCorrectionStorage.BUCKET_MAX:
+                storage.bucket += 1
+            return filtered
+        else:
+            # Sample is outside accepted noise, use bucket to decide whether to accept
+            # Empty bucket (decrease counter)
+            should_accept_new = storage.bucket == 0
+            if storage.bucket > 0:
+                storage.bucket -= 1
+
+            if should_accept_new:
+                # Only accept if within spec limits
+                if ClockCorrectionStorage.SPEC_MIN <= candidate <= ClockCorrectionStorage.SPEC_MAX:
+                    storage.clock_correction = candidate
+                    return candidate
+            return current
+
+        return current
 
     @staticmethod
     def _wrapped_delta(value: int, reference: int, modulus: int) -> int:
@@ -151,14 +196,44 @@ class TdoaFrameMatcher:
         # Equivalent to firmware bitmap truncation: keep lower 32 bits.
         return int(value) & self._truncate_mask
 
+    def _find_frame(self, anchor_id: int, seq: int) -> tuple[AnchorFrame | None, int | None]:
+        """Find a frame by anchor_id and sequence number, returns (frame, age)."""
+        history = self._frames.get(anchor_id)
+        if not history:
+            return None, None
+        for age, frame in enumerate(history):
+            if frame.seq == seq:
+                return frame, age
+        return None, None
+
+    def _select_remotes_by_algorithm(
+        self, remotes_with_age: List[tuple]
+    ) -> List[tuple]:
+        """Process all remotes from packet.
+        
+        Note: Matching algorithm in Bitcraze is used for selecting the second anchor
+        to form a pair for TDoA calculation from the global list of anchors.
+        But we process ALL remotes reported in the packet, since they are already
+        provided references (rxAr_by_An, dist_ticks).
+        
+        Args:
+            remotes_with_age: list of (remote_id, remote_seq, rxAr_by_An, dist_ticks, remote_frame, history_age)
+        
+        Returns:
+            All remotes in same format (all will be processed).
+        """
+        # Process ALL remotes from the packet
+        return remotes_with_age
+
     def _compute(self, parsed_frame) -> tuple[List[Tuple[int, float]], dict]:
         # parsed_frame is expected to be an AnchorReport from data_classes.py
         src = int(parsed_frame.src)
         seq = int(parsed_frame.seq) & 0x7F
-        tx_ts = int(parsed_frame.tx_ts)  # uint32
-        rx_ts = int(parsed_frame.rx_ts) & 0xFFFFFFFF  # uint32
+        tx_ts = int(parsed_frame.tx_ts)  # keep as-is, will truncate during calc
+        rx_ts = int(parsed_frame.rx_ts)  # keep as-is, will truncate during calc
 
-        new_frame = AnchorFrame(seq=seq, tx_ts=tx_ts, rx_ts=rx_ts)
+        now = time.time()
+        new_frame = AnchorFrame(seq=seq, tx_ts=tx_ts, rx_ts=rx_ts, update_time=now)
         self._push_frame(src, new_frame)
         estimated_clock_correction = self._update_clock_correction(src, new_frame)
 
@@ -180,12 +255,46 @@ class TdoaFrameMatcher:
             ref_pos = self._anchors.get(src)
 
         # For each remote anchor Ar listed by current anchor An
+        remotes_with_age = []
         for remote in getattr(parsed_frame, "remotes", []) or []:
             remote_id = int(remote.id)
             remote_seq = int(remote.seq) & 0x7F
-            rxAr_by_An_in_cl_An = int(remote.rx_ts)  # uint32 in anchor clock domain
-            dist_ticks = int(remote.dist_ticks)  # uint16; used as ToF in anchor clock domain
+            rxAr_by_An_in_cl_An = int(remote.rx_ts)  # in anchor clock domain
+            dist_ticks = int(remote.dist_ticks)  # ToF in anchor clock domain
 
+            # Find matching frame
+            remote_frame, history_age = self._find_frame(remote_id, remote_seq)
+            if remote_frame is None:
+                debug_remote = {
+                    "id": remote_id,
+                    "seq": remote_seq,
+                    "remote_rx_ts": rxAr_by_An_in_cl_An,
+                    "dist_ticks": dist_ticks,
+                    "status": "no_remote_frame",
+                }
+                debug_info["remotes"].append(debug_remote)
+                continue
+
+            if history_age is not None and history_age > self._max_remote_history_age:
+                debug_remote = {
+                    "id": remote_id,
+                    "seq": remote_seq,
+                    "remote_rx_ts": rxAr_by_An_in_cl_An,
+                    "dist_ticks": dist_ticks,
+                    "status": "stale_remote_frame",
+                    "history_age": history_age,
+                }
+                debug_info["remotes"].append(debug_remote)
+                continue
+
+            # Store with age for matching algorithm
+            remotes_with_age.append((remote_id, remote_seq, rxAr_by_An_in_cl_An, dist_ticks, remote_frame, history_age))
+
+        # Choose matching algorithm (Bitcraze-compatible)
+        selected_remotes = self._select_remotes_by_algorithm(remotes_with_age)
+
+        # Process selected remotes
+        for remote_id, remote_seq, rxAr_by_An_in_cl_An, dist_ticks, remote_frame, history_age in selected_remotes:
             debug_remote = {
                 "id": remote_id,
                 "seq": remote_seq,
@@ -194,16 +303,10 @@ class TdoaFrameMatcher:
                 "status": "unknown",
             }
 
-            # In Bitcraze, distance field is ToF in ticks; subtract antenna delay.
-            # Your firmware may already pre-compensate; but your config exposes ANTENNA_DELAY_TICKS,
-            # so we follow the Crazyflie convention.
-
-            # If dist_ticks is raw ToF including antenna delay, subtracting is correct.
-            # If firmware already subtracted it, then dist_ticks can be smaller than ANTENNA_DELAY_TICKS.
-            # With auto_antenna_delay enabled we handle both without changing settings.
+            tof_Ar_to_An_in_cl_An = dist_ticks
             if self._subtract_antenna_delay:
                 if self._auto_antenna_delay and dist_ticks <= self._antenna_delay_ticks:
-                    # Looks like it's already compensated.
+                    # Looks like it's already compensated
                     tof_Ar_to_An_in_cl_An = dist_ticks
                     debug_remote["antenna_delay_mode"] = "skipped(auto)"
                 else:
@@ -222,34 +325,23 @@ class TdoaFrameMatcher:
                 debug_info["remotes"].append(debug_remote)
                 continue
 
-            # Find the remote anchor frame (Ar packet) by seq
-            remote_frame, history_age = self._find_frame(remote_id, remote_seq)
-            if remote_frame is None:
-                debug_remote["status"] = "no_remote_frame"
-                debug_info["remotes"].append(debug_remote)
-                continue
-
-            if history_age is not None and history_age > self._max_remote_history_age:
-                debug_remote["status"] = "stale_remote_frame"
-                debug_remote["history_age"] = history_age
-                debug_info["remotes"].append(debug_remote)
-                continue
-
             # Apply clock correction for current anchor An
-            clock_correction = self._clock_correction_by_anchor.get(src, self._clock_correction_default)
+            storage = self._clock_correction_storage.get(src)
+            if storage is not None:
+                clock_correction = storage.clock_correction
+            else:
+                clock_correction = self._clock_correction_default
 
-            # delta_txAr_to_txAn_in_cl_An = tof + truncate(txAn - rxAr_by_An)
-            # Note: txAn and rxAr_by_An are 32-bit in anchor clock domain.
+            # Compute TDoA using Bitcraze formula
             delta_tx = self._truncate_to_anchor_ts(tx_ts - rxAr_by_An_in_cl_An)
             delta_txAr_to_txAn_in_cl_An = int(tof_Ar_to_An_in_cl_An + delta_tx)
 
-            # timeDiffOfArrival_in_cl_T = trunc(rxAn_by_T - rxAr_by_T) - delta_txAr_to_txAn_in_cl_An * clockCorrection
-            delta_rx = self._truncate_to_anchor_ts(rx_ts - (remote_frame.rx_ts & 0xFFFFFFFF))
+            delta_rx = self._truncate_to_anchor_ts(rx_ts - remote_frame.rx_ts)
 
             tdoa_ticks = int(self._tdoa_sign * (delta_rx - (delta_txAr_to_txAn_in_cl_An * clock_correction)))
             distance_diff = SPEED_OF_LIGHT * float(tdoa_ticks) / self._tick_frequency_hz
 
-            # Geometry gate: | ||p-Ar|| - ||p-Aref|| | <= ||Ar - Aref|| for any point p.
+            # Geometry gate
             if ref_pos is not None and self._anchors is not None:
                 ar_pos = self._anchors.get(remote_id)
                 if ar_pos is not None:
@@ -266,7 +358,7 @@ class TdoaFrameMatcher:
                         debug_info["remotes"].append(debug_remote)
                         continue
 
-            # Reject obvious mismatches (wrong seq match, wrap issues, etc)
+            # Hard outlier rejection
             if abs(distance_diff) > self._max_abs_distance_diff_m:
                 debug_remote.update(
                     {
@@ -444,6 +536,19 @@ def solve_tdoa_position(
         residual_rms = float(np.sqrt(np.mean(final_residuals**2)))
         return final_position, residual_rms, iteration_loc, success_loc
 
+    def _compute_rms(position: np.ndarray, anchor_positions_in: np.ndarray, diffs_in: np.ndarray) -> float:
+        if anchor_positions_in.size == 0:
+            return 0.0
+        vec_ref = position - ref_pos
+        dist_ref = np.linalg.norm(vec_ref)
+        if dist_ref < 1e-9:
+            dist_ref = 1e-9
+        vec_other = position - anchor_positions_in
+        dist_other = np.linalg.norm(vec_other, axis=1)
+        dist_other = np.where(dist_other < 1e-9, 1e-9, dist_other)
+        residuals = (dist_ref - dist_other) - diffs_in
+        return float(np.sqrt(np.mean(residuals**2)))
+
     # Optional robust outlier filtering loop
     keep = np.ones(len(diffs), dtype=bool)
     if enable_outlier_filter and len(diffs) > min_required:
@@ -481,7 +586,10 @@ def solve_tdoa_position(
                 # Can't drop more
                 break
 
-    final_position, residual_rms, iteration, success = _solve_once(anchor_positions[keep], diffs[keep])
+    final_position, residual_rms_used, iteration, success = _solve_once(anchor_positions[keep], diffs[keep])
+
+    # RMS over all measurements (including filtered-out ones) to expose noise / mismatch.
+    residual_rms_all = _compute_rms(final_position, anchor_positions, diffs)
 
     for iteration in range(1, max_iter + 1):
         if fixed_z is None:
@@ -512,4 +620,12 @@ def solve_tdoa_position(
             success = True
             break
 
-    return TdoaSolveResult(position=final_position, residual_rms=residual_rms, iterations=iteration, success=success)
+    return TdoaSolveResult(
+        position=final_position,
+        residual_rms=residual_rms_all,
+        residual_rms_used=residual_rms_used,
+        measurements_used=int(np.sum(keep)),
+        measurements_total=int(len(diffs)),
+        iterations=iteration,
+        success=success,
+    )

@@ -14,30 +14,34 @@ from tdoa_solver import SPEED_OF_LIGHT, TdoaFrameMatcher, load_anchors, solve_td
 # -----------------------------
 # User settings (edit here only)
 # -----------------------------
-PORT = "COM5"
+PORT = "COM11"
 BAUD_RATE = 115200
 ANCHORS_JSON = "anchors.example.json"
 
 ENABLE_SOLVE = True
-FIXED_Z = 1.87  # set to None for full 3D solve
+FIXED_Z = 1.1  # set to None for full 3D solve
 TICK_FREQUENCY_HZ = 63_897_600_000.0
 PRINT_RATE_HZ = 2.0  # 0 disables throttling
-ANTENNA_DELAY_TICKS = 16436
+ANTENNA_DELAY_TICKS = 16384
 CLOCK_CORRECTION = 1.0
-MATCH_HISTORY_SIZE = 8
+MATCH_HISTORY_SIZE = 16
+
+# Matching algorithm: "random" or "youngest" (Bitcraze uses "youngest")
+MATCHING_ALGORITHM = "youngest"
 
 # Reference anchor selection
 # Set to an anchor id (e.g. 1) to lock reference to that anchor; set to None to use the incoming frame's src.
-FIXED_REF_ID: int | None = 3
+FIXED_REF_ID: int | None = None
 
 # Debug knobs
 TDOA_SIGN = 1.0  # set to -1.0 to test sign convention
 SUBTRACT_ANTENNA_DELAY = False
 PRINT_MEASUREMENTS = True
+PRINT_MATCH_DEBUG = True  # print reasons when measurements are rejected
 
 # UDP telemetry
 ENABLE_UDP = True
-UDP_HOST = "255.255.255.255"  # broadcast by default; set to e.g. "127.0.0.1" for local
+UDP_HOST = "192.168.0.255"  # broadcast by default; set to e.g. "127.0.0.1" for local
 UDP_PORT = 7777
 UDP_RATE_HZ = 20.0
 
@@ -121,7 +125,7 @@ def parse_frame(frame: bytes):
 	offset += 1
 	tx_ts = struct.unpack_from("<I", payload, offset)[0]
 	offset += 4
-	rx_ts = struct.unpack_from("<Q", payload, offset)[0]
+	rx_ts = struct.unpack_from("<Q", payload, offset)[0]  # Keep full 64-bit value
 	offset += 8
 
 	remotes = []
@@ -172,6 +176,7 @@ def main() -> int:
 		tdoa_sign=TDOA_SIGN,
 		subtract_antenna_delay=SUBTRACT_ANTENNA_DELAY,
 		anchors=anchors,
+		matching_algorithm=MATCHING_ALGORITHM,
 	)
 
 	last_print = 0.0
@@ -180,6 +185,7 @@ def main() -> int:
 	traj_xy: list[tuple[float, float]] = []
 	TRAJ_MAX_POINTS = 200
 	last_initial_position = None
+	last_match_debug = 0.0
 
 	# Filter state
 	pos_hist: list[tuple[float, float, float]] = []  # (t, x, y)
@@ -219,7 +225,7 @@ def main() -> int:
 						anchors=anchors,
 						reference_id=effective_ref,
 						measurements=measurements,
-						initial_position=initial_guess,
+						initial_position=None,
 						fixed_z=FIXED_Z,
 						max_iter=100,
 						damping=1e-2,
@@ -274,10 +280,16 @@ def main() -> int:
 				pos_out = None
 				ok = False
 				rms = None
+				rms_used = None
+				meas_used = None
+				meas_total = None
 				it = None
 				if last_solution is not None:
 					ok = bool(last_solution.success)
 					rms = float(last_solution.residual_rms)
+					rms_used = float(last_solution.residual_rms_used)
+					meas_used = int(last_solution.measurements_used)
+					meas_total = int(last_solution.measurements_total)
 					it = int(last_solution.iterations)
 					p = last_solution.position
 					pos_out = [float(p[0]), float(p[1]), float(p[2])]
@@ -297,6 +309,9 @@ def main() -> int:
 						"pos": pos_out,
 						"ok": ok,
 						"rms": rms,
+						"rms_used": rms_used,
+						"meas_used": meas_used,
+						"meas_total": meas_total,
 						"it": it,
 						"clockCorr": dbg.get("clock_correction_estimate"),
 					},
@@ -315,11 +330,16 @@ def main() -> int:
 						z_out = float(pos_val[2])
 					else:
 						x_out, y_out, z_out = float(pos_val[0]), float(pos_val[1]), float(pos_val[2])
+					rms_all = float(last_solution.residual_rms)
+					rms_used = float(last_solution.residual_rms_used)
+					meas_used = int(last_solution.measurements_used)
+					meas_total = int(last_solution.measurements_total)
 					print(
 						f"ref={effective_ref:3d} seq={parsed.seq:3d} rem={len(parsed.remotes):2d} "
 						f"meas={len(measurements):2d} "
 						f"pos=({x_out: .3f}, {y_out: .3f}, {z_out: .3f}) "
-						f"rms={last_solution.residual_rms:.3f} it={last_solution.iterations} ok={last_solution.success} "
+						f"rms={rms_all:.3f} (used={rms_used:.3f} n={meas_used}/{meas_total}) "
+						f"it={last_solution.iterations} ok={last_solution.success} "
 						f"meas=[{meas_str}]"
 					)
 				else:
@@ -327,6 +347,21 @@ def main() -> int:
 						f"ref={effective_ref:3d} seq={parsed.seq:3d} rem={len(parsed.remotes):2d} meas={len(measurements):2d} "
 						f"clockCorr={dbg.get('clock_correction_estimate')} meas=[{meas_str}]"
 					)
+
+			# Optional: print why measurements are rejected
+			if (
+				PRINT_MATCH_DEBUG
+				and frame_is_ref
+				and _throttled(now, last_match_debug, PRINT_RATE_HZ)
+				and not measurements
+			):
+				last_match_debug = now
+				status_counts: Dict[str, int] = {}
+				for item in (dbg.get("remotes") or []):
+					status = str(item.get("status"))
+					status_counts[status] = status_counts.get(status, 0) + 1
+				if status_counts:
+					print(f"match_debug: {status_counts}")
 	return 0
 
 
